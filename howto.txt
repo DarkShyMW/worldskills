@@ -1,0 +1,252 @@
+НАСТРОЙКА РОУТИНГА МЕЖДУ МАРШУРТИЗАТОРОАМИ И ASA.
+НЕ ЗАБЫВАЕМ, ЧТО NAT - НАХУЙ НЕ НУЖЕН!
+Делаем обычный маршрут со стороны маршрутизатора:
+ip route <адрес_сети_куда_хотим> <маска> [Крайний порт, ИЛИ ip, что смотрит на нас!
+
+проверяем пинги, должны быть.
+ЕСЛИ ОНИ РЕАЛЬНО ЕБАНУЛИСЬ, ТО ДЕЛАЕМ ЭТО:
+Шаг 1 настройка Interesting Traffic
+
+192_168_6_1
+ip access-list extended VPN-TO-SPB
+permit ip 192.168.6.0 0.0.0.255 192.168.53.0 0.0.0.255
+
+SPB-ASA
+access-list VPN-TO-BAU extended permit ip 192.168.53.0 255.255.255.0 192.168.6.0 255.255.255.0
+
+NAT Exclusion
+192_168_6_1
+ip access-list extended acl_nat_rules
+deny ip 192.168.6.0 0.0.0.255 192.168.0.0 0.0.255.255
+permit ip 192.168.6.0 0.0.0.255 any
+ip nat inside source list acl_nat_rules interface FastEthernet8 overload
+
+SPB-ASA
+object network LAN
+subnet 192.168.53.0 255.255.255.0
+object network REMOTE_VPN
+subnet 192.168.0.0 255.255.0.0
+nat (inside,outside) source static LAN LAN destination static REMOTE_VPN REMOTE_VPN route-lookup
+
+Шаг 2 настройка Phase 1 (ISAKMP - ikev1)
+192_168_6_1
+crypto isakmp policy 20
+authentication pre-share
+encryption aes 256
+hash sha
+group 5
+lifetime 86400
+
+SPB-ASA
+crypto ikev1 enable outside
+crypto ikev1 policy 5
+authentication pre-share
+encryption aes-256
+hash sha
+group 5
+lifetime 86400
+Определяем tunnel-group и её аналог на Router
+
+192_168_6_1
+crypto keyring SPBVPNKEY
+pre-shared-key address 84.52.78.112 key secresskey1
+crypto isakmp profile staticL2L
+keyring SPBVPNKEY
+match identity address 84.52.78.112 255.255.255.255
+
+SPB-ASA
+tunnel-group 62.117.66.194 type ipsec-l2l
+tunnel-group 62.117.66.194 ipsec-attributes
+ikev1 pre-shared-key secresskey1
+
+Шаг 3 настройка Phase 2 (IPSEc)
+192_168_6_1
+crypto ipsec transform-set ESP-AES-256 esp-aes 256 esp-sha-hmac
+!
+crypto map outside_map 10 ipsec-isakmp
+set peer 84.52.78.112
+set transform-set ESP-AES-256
+set isakmp-profile staticL2L
+match address VPN-TO-SPB
+!
+interface FastEthernet8
+crypto map outside_map
+
+SPB-ASA
+crypto map outside_map 200 match address VPN-TO-BAU
+crypto map outside_map 200 set peer 62.117.66.194
+crypto map outside_map 200 set ikev1 transform-set ESP-AES-256-SHA
+crypto map outside_map interface outside
+Проверка
+Для проверки прямо с устройств Policy based routing требует пинговать с заданием source.
+К сожалению ASA не умеет пинговать с заданием Source, поэтому проверять будет на роутере.
+
+Также по умолчанию ASA не позволяет пинговать свой внутренний интерфейс со стороны VPN. Но эту проблему решить можно:
+проследить что прописано route-lookup на ASA в NAT Exception:
+
+nat (inside,outside) source static LAN LAN destination static REMOTE_VPN REMOTE_VPN route-lookup
+Дать команду:
+
+management-access inside
+Проверяем пинг от роутера:
+
+Проверяем пинг от роутера:
+ping 192.168.53.23 source 192.168.6.1
+необходимо время для построения туннеля IPSec.
+Проверяем ike:
+show crypto isakmp sa
+Здесь находим нас интересующие пару адресов. Если показывает QM_IDLE - значит всё нормально.
+И наконец можно проверить что трафик успешно шифруется:
+show crypto ipsec sa peer 84.52.78.112
+Счетчики #pkts encrypt и #pkts decrypt должны увеличиваться.
+
+//
+// named.conf
+//
+// Provided by Red Hat bind package to configure the ISC BIND named(8) DNS
+// server as a caching only nameserver (as a localhost DNS resolver only).
+//
+// See /usr/share/doc/bind*/sample/ for example named configuration files.
+//
+ 
+options {
+	listen-on port 53 { 127.0.0.1;192.168.10.10; };
+//	listen-on-v6 port 53 { ::1; };
+	directory 	"/var/named";
+	dump-file 	"/var/named/data/cache_dump.db";
+	statistics-file "/var/named/data/named_stats.txt";
+	memstatistics-file "/var/named/data/named_mem_stats.txt";
+	secroots-file	"/var/named/data/named.secroots";
+	recursing-file	"/var/named/data/named.recursing";
+	allow-query     { localhost; 192.168.10.0/26; };
+ 
+	/* 
+	 - If you are building an AUTHORITATIVE DNS server, do NOT enable recursion.
+	 - If you are building a RECURSIVE (caching) DNS server, you need to enable 
+	   recursion. 
+	 - If your recursive DNS server has a public IP address, you MUST enable access 
+	   control to limit queries to your legitimate users. Failing to do so will
+	   cause your server to become part of large scale DNS amplification 
+	   attacks. Implementing BCP38 within your network would greatly
+	   reduce such attack surface 
+	*/
+	recursion yes;
+ 
+	dnssec-enable no;
+	dnssec-validation no;
+ 
+	managed-keys-directory "/var/named/dynamic";
+ 
+	pid-file "/run/named/named.pid";
+	session-keyfile "/run/named/session.key";
+ 
+	/* https://fedoraproject.org/wiki/Changes/CryptoPolicy */
+	include "/etc/crypto-policies/back-ends/bind.config";
+};
+ 
+logging {
+        channel default_debug {
+                file "data/named.run";
+                severity dynamic;
+        };
+};
+ 
+zone "." IN {
+	type hint;
+	file "named.ca";
+};
+ 
+//forward zone
+zone "skill39.wsr" IN {
+     type master;
+     file "/opt/dns/skill39.wsr.db";
+     allow-query { any; };
+};
+ 
+ 
+//backward zone
+#zone "10.168.192.in-addr.arpa" IN {
+#     type master;
+#     file "skill39.wsr.rev";
+#     allow-update { none; };
+#     allow-query { any; };
+#}; 
+ 
+ 
+include "/etc/named.rfc1912.zones";
+include "/etc/named.root.key";
+ 
+ 
+ 
+ 
+ //ZONES
+   $TTL 1D @	IN SOA @ root (
+                           1	; serial
+                           1D	; refresh
+                           1H	; retry
+                           1W	; expire
+                           3H )	; minimum
+           NS	skill39.wsr.
+           A 192.168.10.10
+
+  hq-srv1	 A 192.168.10.10
+  hq-srv2  A 192.168.10.20
+  hq-fs	   A 192.168.10.30
+  
+  
+  #NAT-PAT
+1. Выдаем ACL - список
+R1(config)# access-list 1 permit адрес_сети обратная_Маска
+2. Настройка трансляции.
+R1(config)# ip nat inside source list 1 interface fastethernet 0/1 overload
+3.Настройка внутреннего интерфейса в отношение NAT.
+R1(config)# interface fastethernet 0/0
+R1(config-if)# ip nat inside
+4.Настройка внешнего интерфейса в отношение NAT.
+R1(config)# interface fastethernet 0/1
+R1(config-if)# ip nat outside 
+Команды для проверки работы NAT
+show ip nat translations - Выводит активные преобразования.
+show ip nat statistics - выводит статистику по NAT преобразованиям.
+
+#В DHCP БЕЗ КОВЫЧЕК ПОРТ!
+
+ASA Route
+ASA(config)# route inside 192.168.2.0 255.255.255.0 192.168.1.1
+ASA PAT
+https://www.geeksforgeeks.org/port-address-translation-pat-on-adaptive-security-appliance-asa/
+
+ASA Security
+(outside) security-level 100
+same-security-traffic permit inter-interface
+same-security-traffic permit intra-interface
+
+slmgr /rearm
+
+
+Настройка DNS-reverse:
+
+заходим на master-сервер > zone properties  > Zone transfers > allow zone transfers > to any server
+
+
+
+# dhcpd.conf
+#
+# Sample configuration file for ISC dhcpd
+#
+ddns-update-style none;
+option domain-name "skill39.wsr";
+ 
+default-lease-time 600;
+max-lease-time 7200;
+ 
+authoritative;
+log-facility local7;
+ 
+subnet 192.168.10.0 netmask 255.255.255.192 {
+        range 192.168.10.40         192.168.10.50;
+        option routers 192.168.10.1;
+#       option subnet-mask 255.255.255.192;
+        option domain-search "skill39.wsr";
+        option domain-name-servers       192.168.10.10;
+}
