@@ -1,0 +1,90 @@
+# Задача:
+
+OpenLDAP server L-SRV:
+	+ Аутентификация на L-SRV (Группа: Guest), L-CLI-A, L-CLI-B (Группы: Admin, Guest)
+	+ Home dir: NFS L-SRV:/opt/homes
+	+ OpenVPN Auth (Группа: VPN)
+	+ Site auth intra.skill39.wsr (Группа: webuser)
+
+
+
+Пакеты: slapd, ldap-utils
+
+Рекомендуется делать после настройки DNS
+
+	
+# Создаем локальных пользователей и группы, затем импортируем их в LDAP
+	
+# Создаем группы:
+	[root@L-SRV ~]# groupadd Admin -g 2000
+	[root@L-SRV ~]# groupadd Guest -g 2001
+	[root@L-SRV ~]# groupadd VPN -g 2002
+	[root@L-SRV ~]# groupadd webuser -g 2003
+
+# Создаем tux'a.
+	[root@L-SRV ~]# useradd -g Admin -M -u 2000 -d /opt/homes/tux -s /bin/bash tux
+	[root@L-SRV ~]# echo "tux:toor" | chpasswd
+
+# Создаем скрипт для создания пользователей:
+	#!/bin/bash
+
+	for ((i=1; i < 100; i++))
+	do
+			useradd -g Guest -M -u $((2100+$i)) -d /opt/homes/user$i -s /bin/bash user$i
+			echo "user$i:P@ssw0rd" | passwd
+
+			useradd -g VPN -M -u $((2200+$i)) -d /opt/homes/nologin -s /bin/nologin vpn$i
+			echo "vpn$i:Passw0rd" | chpasswd
+
+			useradd -g webuser -M -u $((2300+$i)) -d /opt/homes/nologin -s /bin/nologin webuser$i
+			echo "webuser$i:P@ssword" | chpasswd
+
+	#       userdel -r user$i			# для удаления пользователей, когда импортируем их в LDAP
+	#       userdel -r vpn$i
+	#       userdel -r webuser$i
+	done
+
+# Копируем данные необходимых пользователей и групп в отдельные файлы:
+	[root@L-SRV ~]# cat /etc/group  | grep :200.: > groups
+	[root@L-SRV ~]# cat /etc/passwd | grep :2.0.: > users
+
+# Migration Tools:
+  [root@L-SRV ~]# cd /usr/share/migrationtools
+  # Правим migration_common.ph (первые цифры-номера строк):
+	58         $NAMINGCONTEXT{'passwd'}            = "ou=Users";
+	61         $NAMINGCONTEXT{'group'}             = "ou=Groups";
+	71 $DEFAULT_MAIL_DOMAIN = "skill39.wsr";
+	74 $DEFAULT_BASE = "dc=skill39,dc=wsr";
+	90 $EXTENDED_SCHEMA = 1;
+
+# Правим migration_base.pl, migration_group.pl, migration_passwd.pl:
+	require 'migrate_common.ph'; поменять на полный путь: require '/usr/share/migrationtools/migrate_common.ph';
+	
+# Правим migration_passwd.pl:
+  # objectClass kerberosSecurityObject в наших схемах нет, его не надо указывать, иначе ничего не импортируется (да и не нужен он нам). Либо можно не комментировать, а убрать их после создания ldif файла: grep -v kerb | grep -v krb > new_users.ldif
+  # Комментируем некоторые строки в migration_passwd.pl (первые цифры-номера строк):
+	140 #       if ($DEFAULT_REALM) {
+	141 #               print $HANDLE "objectClass: kerberosSecurityObject\n";
+	142 #       }
+
+	150 #       if ($DEFAULT_REALM) {
+	151 #               print $HANDLE "krbName: $user\@$DEFAULT_REALM\n";
+	152 #       }
+
+# Теперь генерируем файлы .ldif:
+	[root@L-SRV migrationtools]# ./migrate_base.pl > /root/base.ldif	# Оставить записи только для OU=Group и OU=Users
+	[root@L-SRV migrationtools]# ./migrate_group.pl /root/migrate/groups > /root/migrate/groups.ldif
+	[root@L-SRV migrationtools]# ./migrate_passwd.pl /root/users > /root/users.ldif
+
+# Добавляем все это дело в LDAP (Если будет ругаться, надо подключить схемы):
+	[root@L-SRV migrationtools]# cd
+	[root@L-SRV ~]# ldapadd -D cn=admin,dc=skill39,dc=wsr -w toor -f base.ldif
+	[root@L-SRV ~]# ldapadd -D cn=admin,dc=skill39,dc=wsr -w toor -f groups.ldif
+	[root@L-SRV ~]# ldapadd -D cn=admin,dc=skill39,dc=wsr -w toor -f users.ldif
+
+# Проверяем:
+	[root@L-SRV ~]# ldapsearch -x
+  
+# !!!! Удаляем созданные локальные пользователи и группы (которые скриптом - в скрипте) !!!!
+  
+  

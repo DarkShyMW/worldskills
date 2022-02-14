@@ -1,0 +1,67 @@
+﻿
+# Подготовка:
+[root@R-FW ~]# cd /usr/share/easy-rsa/3.0.3/	# переходим в директорию Easy-RSA. Либо можно копировать оттуда все файлы в нужную директорию.
+
+Возможнве ключи в файле vars:
+
+export KEY_COUNTRY="RU"
+export KEY_PROVINCE="Sankt-Petersburg"
+export KEY_CITY="Balashikha"
+export KEY_ORG="WorldSkills Russia"
+export KEY_EMAIL="admin@wsr.ru"
+export KEY_CN="CN"
+export KEY_OU="OU"
+export KEY_NAME="NAME"
+export KEY_ALTNAMES="ALT_NAME"
+
+
+[root@R-FW 3.0.3]# . ./vars										# Инициализируем переменные $ENV (их перехватывает OpenSSL)
+[root@R-FW 3.0.3]# ./easyrsa init-pki									# Инициализируем PKI
+
+# * - Далее, если отредактировали vars или openssl-1.0.0.cnf, то просто Enter - Enter ... Если нет, меняем Coutry и Organization. Больше ничего не меняем
+
+# CA
+[root@R-FW 3.0.3]# ./easyrsa build-ca  nopass # *
+
+# OpenVPN Server Cert
+[root@R-FW 3.0.3]# ./easyrsa gen-req server nopass # *. Также со всем соглашаемся ( y )
+[root@R-FW 3.0.3]# ./easyrsa sign-req server server
+
+# OpenVPN Client Cert
+[root@R-FW 3.0.3]# ./easyrsa gen-req client # *. Также со всем соглашаемся ( y )
+[root@R-FW 3.0.3]# ./easyrsa sign-req client server
+
+# OpenVPN DH
+[root@R-FW 3.0.3]# ./easyrsa gen-dh # И ждем. Минутку
+
+# OpenVPN TLS key генерируется с помощью OpenVPN, поэтому генерируем его на самом сервере OpenVPN. Для надежности можно перекинуть на L-FW (если в задании сказано генерировать всю информацию на L-FW)
+[root@L-FW pki]# openvpn --genkey --secret ta.key
+
+# Site certificates (повторять столько раз, сколько нужно сертификатов для сайтов)
+[root@R-FW 3.0.3]# ./easyrsa gen-req <cert_name> nopass # *. Также со всем соглашаемся ( y )
+[root@R-FW 3.0.3]# ./easyrsa sign-req server <cert_name>
+
+# Если требуется pem файл с ключом (например, для HAProxy), то:
+[root@R-FW pki]# cat <cert_name>.crt > <cert_name>.pem ; cat <cert_name>.key >> <cert_name>.pem
+
+#Site certificates (Если первый вариант не работает) (повторять столько раз, сколько нужно сертификатов для сайтов)
+[root@R-FW 3.0.3]# cd keys
+[root@R-FW pki]# openssl req -new -nodes -newkey rsa:2048 -out site.csr -keyout site.key				# Генерируем запрос на подписку сертификата
+[root@R-FW pki]# openssl x509 -req -CA CA.crt -CAkey CA.key -CAcreateserial -days 5000 -in site.csr -out site.crt	# Подписываем нашим CA
+# Затем *.csr можем удалить, это запрос на подписку сертификата. Можно и оставить, никому не помешает. Но нигде, кроме подписки сертификата не используется
+
+# Чтобы не терять времени, перемещаем все содержимое папки keys в /etc/ca:
+[root@R-FW 3.0.3]# mkdir /etc/ca
+[root@R-FW 3.0.3]# cp p/* /etc/ca
+
+# Создаем папку на OpenVPN сервере /opt/vpn/keys и перекидыва туда ключи с CA:
+[root@L-FW ~]# mkdir -p /opt/vpn/keys
+# Переключаемся на R-FW:
+[root@R-FW 2.0]# scp <-P <порт SSH> > /etc/ca/* <IP OpenVPN сервера>:/opt/vpn/keys/	# На все соглашаемся. 
+#Если по заданию на OpenVPN сервере нужно было изменить настройки SSH (порт и пользователи), тогда указываем порт и:
+#  Полные права всем: [root@L-FW ~]# chmod 777 /opt/vpn/keys
+#  Либо передаем ключи с помощью "[root@R-FW ~]# python -m SimpleHTTPServer". На принимающей стороне: [root@L-FW pki]# lynx <IP CA (R-FW)>:8000 и сохраняем, что нужно
+#  Либо временно меняем настройки SSH (комментируем строку AllowUsers)
+#  Либо пишем исключение для хоста R-FW (высший скилл) sshd_config: 
+#    Match Address <IP CA (R-FW)>
+#      AllowUsers root
